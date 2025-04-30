@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+.DS_Store
+team_config.py
+weekly_commit_trend*.png
+weekly_commit_trend.csv
+team_productivity_report.csv 
