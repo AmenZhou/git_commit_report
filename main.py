@@ -7,10 +7,85 @@ from collections import Counter
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import sys
+import argparse
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
 load_dotenv()
+
+def parse_arguments():
+    """Parse command line arguments for date range configuration"""
+    parser = argparse.ArgumentParser(
+        description='Generate team productivity reports from GitHub commits',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python main.py                                    # Use default Q1 2025 dates
+  python main.py --start 2024-10-01 --end 2024-12-31  # Q4 2024
+  python main.py --start 2025-04-01 --end 2025-06-30  # Q2 2025
+  python main.py --preset q2-2025                      # Use Q2 2025 preset
+  python main.py --preset q3-2025                      # Use Q3 2025 preset
+        """
+    )
+    
+    parser.add_argument(
+        '--start', 
+        type=str, 
+        help='Start date in YYYY-MM-DD format (default: 2025-01-01)'
+    )
+    parser.add_argument(
+        '--end', 
+        type=str, 
+        help='End date in YYYY-MM-DD format (default: 2025-03-31)'
+    )
+    parser.add_argument(
+        '--preset',
+        choices=['q1-2025', 'q2-2025', 'q3-2025', 'q4-2025', 'q1-2024', 'q2-2024', 'q3-2024', 'q4-2024'],
+        help='Use a predefined quarter preset'
+    )
+    
+    return parser.parse_args()
+
+def get_date_range(args):
+    """Get the date range based on arguments, environment variables, or defaults"""
+    
+    # Define quarter presets
+    presets = {
+        'q1-2024': ('2024-01-01', '2024-03-31'),
+        'q2-2024': ('2024-04-01', '2024-06-30'),
+        'q3-2024': ('2024-07-01', '2024-09-30'),
+        'q4-2024': ('2024-10-01', '2024-12-31'),
+        'q1-2025': ('2025-01-01', '2025-03-31'),
+        'q2-2025': ('2025-04-01', '2025-06-30'),
+        'q3-2025': ('2025-07-01', '2025-09-30'),
+        'q4-2025': ('2025-10-01', '2025-12-31'),
+    }
+    
+    # Priority: command line args > environment variables > defaults
+    if args.preset:
+        start_date, end_date = presets[args.preset]
+        print(f"Using preset '{args.preset}': {start_date} to {end_date}")
+    elif args.start and args.end:
+        start_date, end_date = args.start, args.end
+        print(f"Using custom date range: {start_date} to {end_date}")
+    else:
+        # Check environment variables
+        start_date = os.getenv("REPORT_START_DATE", "2025-01-01")
+        end_date = os.getenv("REPORT_END_DATE", "2025-03-31")
+        if os.getenv("REPORT_START_DATE") or os.getenv("REPORT_END_DATE"):
+            print(f"Using environment variables: {start_date} to {end_date}")
+        else:
+            print(f"Using default Q1 2025: {start_date} to {end_date}")
+    
+    # Convert to ISO format with timezone
+    start_iso = f"{start_date}T00:00:00Z"
+    end_iso = f"{end_date}T23:59:59Z"
+    
+    return start_iso, end_iso, start_date, end_date
+
+# Parse command line arguments
+args = parse_arguments()
+REPORT_START, REPORT_END, START_DATE_STR, END_DATE_STR = get_date_range(args)
 
 # ========== CONFIGURATION ==========
 # Get GitHub token from environment variable
@@ -45,15 +120,11 @@ TEAMS = {
 # Example: BRANCHES = ["master", "develop"]
 BRANCHES = None  # Search all branches
 
-# Q1 2025 date range
-Q1_START = "2025-01-01T00:00:00Z"
-Q1_END = "2025-03-31T23:59:59Z"
-
 # Save results to CSV file?
 SAVE_TO_CSV = True
-CSV_FILENAME = "team_productivity_report.csv"
-WEEKLY_TREND_FILENAME = "weekly_commit_trend.csv"
-CHART_FILENAME = "weekly_commit_trend.png"
+CSV_FILENAME = f"team_productivity_report_{START_DATE_STR}_to_{END_DATE_STR}.csv"
+WEEKLY_TREND_FILENAME = f"weekly_commit_trend_{START_DATE_STR}_to_{END_DATE_STR}.csv"
+CHART_FILENAME = f"weekly_commit_trend_{START_DATE_STR}_to_{END_DATE_STR}.png"
 # ====================================
 
 HEADERS = {
@@ -78,8 +149,8 @@ def fetch_commits(repo, username):
             print(f"Searching branch '{branch}' in {repo}...")
             params = {
                 "author": username,
-                "since": Q1_START,
-                "until": Q1_END,
+                "since": REPORT_START,
+                "until": REPORT_END,
                 "sha": branch,  # Specify the branch
                 "per_page": 100
             }
@@ -116,8 +187,8 @@ def fetch_commits(repo, username):
     # If searching all branches
     params = {
         "author": username,
-        "since": Q1_START,
-        "until": Q1_END,
+        "since": REPORT_START,
+        "until": REPORT_END,
         "per_page": 100
     }
 
@@ -152,13 +223,27 @@ def fetch_commits(repo, username):
 
     return commits
 
-def get_week_number(date_str):
-    date = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
-    return date.isocalendar()[1]  # Returns ISO week number
+def get_week_number(date_str, start_date_str):
+    """Calculate week number relative to the start date"""
+    commit_date = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+    start_date = datetime.strptime(start_date_str, "%Y-%m-%d")
+    
+    # Calculate days difference and convert to weeks
+    days_diff = (commit_date.date() - start_date.date()).days
+    week_num = (days_diff // 7) + 1
+    return max(1, week_num)
+
+def get_total_weeks(start_date_str, end_date_str):
+    """Calculate total number of weeks in the date range"""
+    start_date = datetime.strptime(start_date_str, "%Y-%m-%d")
+    end_date = datetime.strptime(end_date_str, "%Y-%m-%d")
+    days_diff = (end_date - start_date).days
+    return (days_diff // 7) + 1
 
 def create_team_trend_chart(team_name, team_members, team_activity):
-    # Prepare data for plotting
-    weeks = list(range(1, 14))  # Weeks 1-13 for Q1 2025
+    # Get total weeks for the date range
+    total_weeks = get_total_weeks(START_DATE_STR, END_DATE_STR)
+    weeks = list(range(1, total_weeks + 1))
     
     # Create a dictionary to store weekly commits per user
     weekly_user_commits = {user: [0] * len(weeks) for user in team_members}
@@ -167,8 +252,8 @@ def create_team_trend_chart(team_name, team_members, team_activity):
     for user in team_members:
         if user in team_activity:
             for commit in team_activity[user]:
-                week_num = get_week_number(commit["date"])
-                if week_num in weeks:
+                week_num = get_week_number(commit["date"], START_DATE_STR)
+                if 1 <= week_num <= total_weeks:
                     weekly_user_commits[user][week_num - 1] += 1
     
     # Create the plot
@@ -201,7 +286,7 @@ def create_team_trend_chart(team_name, team_members, team_activity):
                             fontsize=8)
     
     # Customize the plot
-    plt.title(f'Q1 2025 Weekly Commit Activity - {team_name} Team', pad=20)
+    plt.title(f'{START_DATE_STR} to {END_DATE_STR} Weekly Commit Activity - {team_name} Team', pad=20)
     plt.xlabel('Week')
     plt.ylabel('Number of Commits')
     plt.xticks(rotation=45)
@@ -224,7 +309,7 @@ def create_team_trend_chart(team_name, team_members, team_activity):
     plt.tight_layout()
     
     # Save the plot
-    plt.savefig(f'weekly_commit_trend_{team_name.lower()}.png', dpi=300, bbox_inches='tight')
+    plt.savefig(f'weekly_commit_trend_{team_name.lower()}_{START_DATE_STR}_to_{END_DATE_STR}.png', dpi=300, bbox_inches='tight')
     plt.close()
 
 # Run for all users and repos
@@ -264,10 +349,13 @@ if SAVE_TO_CSV:
 
     # Calculate and save weekly trends
     weekly_commits = defaultdict(int)
+    total_weeks = get_total_weeks(START_DATE_STR, END_DATE_STR)
+    
     for user, commits in team_activity.items():
         for commit in commits:
-            week_num = get_week_number(commit["date"])
-            weekly_commits[week_num] += 1
+            week_num = get_week_number(commit["date"], START_DATE_STR)
+            if 1 <= week_num <= total_weeks:
+                weekly_commits[week_num] += 1
 
     # Sort weeks chronologically
     sorted_weeks = sorted(weekly_commits.items())
@@ -278,11 +366,16 @@ if SAVE_TO_CSV:
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
 
-        # Include all weeks in Q1, even those with zero commits
-        for week_num in range(1, 14):  # Weeks 1-13 for Q1 2025
-            current_date = datetime.strptime("2025-01-01", "%Y-%m-%d")
-            week_start = current_date + timedelta(weeks=week_num-1)
+        # Include all weeks in the date range, even those with zero commits
+        start_date = datetime.strptime(START_DATE_STR, "%Y-%m-%d")
+        for week_num in range(1, total_weeks + 1):
+            week_start = start_date + timedelta(weeks=week_num-1)
             week_end = week_start + timedelta(days=6)
+            
+            # Ensure week_end doesn't exceed the actual end date
+            actual_end_date = datetime.strptime(END_DATE_STR, "%Y-%m-%d")
+            if week_end > actual_end_date:
+                week_end = actual_end_date
             
             writer.writerow({
                 "week_number": week_num,
@@ -296,4 +389,5 @@ if SAVE_TO_CSV:
     # Create and save the visualizations for each team
     for team_name, team_members in TEAMS.items():
         create_team_trend_chart(team_name, team_members, team_activity)
-        print(f"✅ Generated commit trend chart for {team_name} team: 'weekly_commit_trend_{team_name.lower()}.png'")
+        chart_filename = f"weekly_commit_trend_{team_name.lower()}_{START_DATE_STR}_to_{END_DATE_STR}.png"
+        print(f"✅ Generated commit trend chart for {team_name} team: '{chart_filename}'")
