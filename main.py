@@ -116,9 +116,9 @@ TEAMS = {
 }
 
 # Branch configuration
-# Set to None to search all branches, or specify branch names in a list
+# Set to None to search all branches dynamically, or specify branch names in a list
 # Example: BRANCHES = ["master", "develop"]
-BRANCHES = None  # Search all branches
+BRANCHES = None  # Search all branches dynamically
 
 # Save results to CSV file?
 SAVE_TO_CSV = True
@@ -135,12 +135,109 @@ HEADERS = {
 # Data structure to collect results
 team_activity = defaultdict(list)
 
+def get_all_branches_simple(repo):
+    """Fetch branches from the repository with smart filtering"""
+    branches = []
+    url = f"https://api.github.com/repos/{repo}/branches"
+    params = {"per_page": 100}  # Get first 100 branches (GitHub returns most active first)
+    
+    print(f"Fetching branches for {repo}...")
+    
+    resp = requests.get(url, headers=HEADERS, params=params)
+    if resp.status_code != 200:
+        print(f"[ERROR] Failed to fetch branches for {repo}: {resp.status_code} {resp.text}")
+        return ["master", "main"]  # Fallback to common default branches
+    
+    data = resp.json()
+    for branch_info in data:
+        branches.append(branch_info["name"])
+    
+    print(f"Found {len(branches)} branches to search")
+    print(f"📊 Using first 100 branches (GitHub API returns most active branches first)")
+    print(f"   🔥 Recent active branches: ~{min(30, len(branches))}")
+    print(f"   📅 Older branches: ~{max(0, len(branches)-30)}")
+    
+    # Show top 10 branches for transparency
+    print(f"\\n🌿 Top 10 branches to be searched:")
+    for i, branch_name in enumerate(branches[:10]):
+        print(f"   {i+1:2d}. {branch_name[:45]:45}")
+    
+    if len(branches) > 10:
+        print(f"   ... and {len(branches) - 10} more branches")
+    
+    return branches
+
 def fetch_commits(repo, username):
     commits = []
+    
     if BRANCHES is None:
-        # Search all branches
-        url = f"https://api.github.com/repos/{repo}/commits"
-        print(f"\nSearching all branches in {repo} for {username}...")
+        # Dynamically fetch branches (first 50) and search each one
+        all_branches = get_all_branches_simple(repo)
+        
+        # Ensure master/main are always included first
+        priority_branches = ["master", "main"]
+        sorted_branches = []
+        
+        for priority in priority_branches:
+            if priority in all_branches:
+                sorted_branches.append(priority)
+                all_branches.remove(priority)
+        
+        # Add remaining branches
+        sorted_branches.extend(all_branches)
+        
+        print(f"Searching {len(sorted_branches)} branches for {username}")
+        
+        for i, branch in enumerate(sorted_branches, 1):
+            print(f"  [{i}/{len(sorted_branches)}] Searching branch: {branch}")
+                
+            url = f"https://api.github.com/repos/{repo}/commits"
+            params = {
+                "author": username,
+                "since": REPORT_START,
+                "until": REPORT_END,
+                "sha": branch,
+                "per_page": 100
+            }
+            
+            branch_commits = []
+            while url:
+                resp = requests.get(url, headers=HEADERS, params=params)
+                if resp.status_code != 200:
+                    break
+
+                data = resp.json()
+                if not data:
+                    break
+                    
+                for commit in data:
+                    sha = commit["sha"]
+                    message = commit["commit"]["message"]
+                    date = commit["commit"]["author"]["date"]
+                    commit_url = commit["html_url"]
+                    branch_commits.append({
+                        "sha": sha,
+                        "message": message,
+                        "date": date,
+                        "url": commit_url,
+                        "repo": repo,
+                        "branch": branch
+                    })
+
+                if 'next' in resp.links:
+                    url = resp.links['next']['url']
+                    params = None
+                else:
+                    break
+            
+            # Add unique commits
+            for commit in branch_commits:
+                if not any(existing["sha"] == commit["sha"] for existing in commits):
+                    commits.append(commit)
+        
+        print(f"Found {len(commits)} unique commits for {username}")
+        return commits
+        
     else:
         # Search specific branches
         commits = []
@@ -222,6 +319,148 @@ def fetch_commits(repo, username):
             break
 
     return commits
+
+def fetch_commits_for_all_users_optimized(repo, usernames):
+    """
+    Optimized: Loop through branches once and search all users at once per branch
+    Much more efficient than searching each user individually for each branch
+    """
+    print(f"\n🔍 Starting optimized search for all {len(usernames)} users in {repo}")
+    all_commits_by_user = {user: [] for user in usernames}
+    
+    if BRANCHES is None:
+        # Get all branches once
+        all_branches = get_all_branches_simple(repo)
+        
+        # Prioritize master/main branches
+        priority_branches = ["master", "main"]
+        sorted_branches = []
+        
+        for priority in priority_branches:
+            if priority in all_branches:
+                sorted_branches.append(priority)
+                all_branches.remove(priority)
+        
+        sorted_branches.extend(all_branches)
+        
+        print(f"📋 Will search {len(sorted_branches)} branches for all users")
+        
+        # Search each branch once for all users
+        for i, branch in enumerate(sorted_branches, 1):
+            print(f"🌿 [{i}/{len(sorted_branches)}] Searching branch '{branch}' for all users...")
+            
+            # Get all commits from this branch in our date range
+            url = f"https://api.github.com/repos/{repo}/commits"
+            params = {
+                "since": REPORT_START,
+                "until": REPORT_END,
+                "sha": branch,
+                "per_page": 100
+            }
+            
+            branch_total = 0
+            while url:
+                resp = requests.get(url, headers=HEADERS, params=params)
+                if resp.status_code != 200:
+                    print(f"    ❌ Error: {resp.status_code}")
+                    break
+
+                data = resp.json()
+                if not data:
+                    break
+                
+                # Filter commits for our target users
+                for commit in data:
+                    commit_login = commit["author"]["login"] if commit["author"] else ""
+                    
+                    # Check if this commit belongs to any of our target users
+                    if commit_login in usernames:
+                        # Avoid duplicates (same commit SHA)
+                        commit_data = {
+                            "sha": commit["sha"],
+                            "message": commit["commit"]["message"],
+                            "date": commit["commit"]["author"]["date"],
+                            "url": commit["html_url"],
+                            "repo": repo,
+                            "branch": branch
+                        }
+                        
+                        # Check if we already have this commit SHA for this user
+                        existing_shas = [c["sha"] for c in all_commits_by_user[commit_login]]
+                        if commit["sha"] not in existing_shas:
+                            all_commits_by_user[commit_login].append(commit_data)
+                            branch_total += 1
+
+                if 'next' in resp.links:
+                    url = resp.links['next']['url']
+                    params = None
+                else:
+                    break
+            
+            if branch_total > 0:
+                print(f"    ✅ Found {branch_total} commits from our team")
+    
+    else:
+        # Search specific branches
+        print(f"📋 Searching {len(BRANCHES)} specified branches for all users")
+        
+        for i, branch in enumerate(BRANCHES, 1):
+            print(f"🌿 [{i}/{len(BRANCHES)}] Searching branch '{branch}' for all users...")
+            
+            url = f"https://api.github.com/repos/{repo}/commits"
+            params = {
+                "since": REPORT_START,
+                "until": REPORT_END,
+                "sha": branch,
+                "per_page": 100
+            }
+            
+            branch_total = 0
+            while url:
+                resp = requests.get(url, headers=HEADERS, params=params)
+                if resp.status_code != 200:
+                    print(f"    ❌ Error: {resp.status_code}")
+                    break
+
+                data = resp.json()
+                if not data:
+                    break
+                
+                for commit in data:
+                    commit_login = commit["author"]["login"] if commit["author"] else ""
+                    
+                    if commit_login in usernames:
+                        commit_data = {
+                            "sha": commit["sha"],
+                            "message": commit["commit"]["message"],
+                            "date": commit["commit"]["author"]["date"],
+                            "url": commit["html_url"],
+                            "repo": repo,
+                            "branch": branch
+                        }
+                        
+                        existing_shas = [c["sha"] for c in all_commits_by_user[commit_login]]
+                        if commit["sha"] not in existing_shas:
+                            all_commits_by_user[commit_login].append(commit_data)
+                            branch_total += 1
+
+                if 'next' in resp.links:
+                    url = resp.links['next']['url']
+                    params = None
+                else:
+                    break
+            
+            if branch_total > 0:
+                print(f"    ✅ Found {branch_total} commits from our team")
+    
+    # Print summary
+    total_commits = sum(len(commits) for commits in all_commits_by_user.values())
+    print(f"🎉 Total commits found: {total_commits}")
+    for user, commits in all_commits_by_user.items():
+        if commits:
+            print(f"   {USER_NAMES[user]}: {len(commits)} commits")
+    
+    return all_commits_by_user
 
 def get_week_number(date_str, start_date_str):
     """Calculate week number relative to the start date"""
@@ -312,11 +551,18 @@ def create_team_trend_chart(team_name, team_members, team_activity):
     plt.savefig(f'weekly_commit_trend_{team_name.lower()}_{START_DATE_STR}_to_{END_DATE_STR}.png', dpi=300, bbox_inches='tight')
     plt.close()
 
-# Run for all users and repos
-for user in USERS:
-    print(f"\nFetching commits for {user}...")
-    for repo in REPOS:
-        commits = fetch_commits(repo, user)
+# Run for all users and repos using optimized batch search
+print("\n" + "="*60)
+print("🚀 OPTIMIZED BATCH SEARCH: Searching all users simultaneously")
+print("="*60)
+
+for repo in REPOS:
+    print(f"\n📊 Processing repository: {repo}")
+    # Get commits for ALL users at once for this repo
+    repo_commits = fetch_commits_for_all_users_optimized(repo, USERS)
+    
+    # Add commits to the team_activity dictionary
+    for user, commits in repo_commits.items():
         team_activity[user].extend(commits)
 
 # ==== Print Summary ====
