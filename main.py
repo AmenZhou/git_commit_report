@@ -135,6 +135,177 @@ HEADERS = {
 # Data structure to collect results
 team_activity = defaultdict(list)
 
+def get_team_commits_from_prs(repo, team_usernames):
+    """
+    Get commits from Pull Requests created by team members
+    Uses GitHub Search API for efficient PR discovery by author
+    """
+    print(f"🔍 Finding Pull Requests by team members in {repo}...")
+    
+    all_commits = []
+    
+    # Search for PRs by each team member using GitHub Search API
+    for username in team_usernames:
+        print(f"   👤 Searching PRs by {username}...")
+        
+        # Use GitHub Search API to find PRs by author
+        search_url = "https://api.github.com/search/issues"
+        
+        # Format date range for GitHub search (YYYY-MM-DD format)
+        start_date_str = REPORT_START[:10]  # Get YYYY-MM-DD part
+        end_date_str = REPORT_END[:10]
+        
+        # Search query: PRs by author in specific repo within date range
+        search_query = f"repo:{repo} type:pr author:{username} created:{start_date_str}..{end_date_str}"
+        
+        params = {
+            "q": search_query,
+            "sort": "updated",
+            "order": "desc",
+            "per_page": 100
+        }
+        
+        page = 1
+        user_pr_count = 0
+        user_commit_count = 0
+        
+        while True:
+            params["page"] = page
+            resp = requests.get(search_url, headers=HEADERS, params=params)
+            
+            if resp.status_code != 200:
+                print(f"      ❌ Error searching PRs: {resp.status_code}")
+                break
+                
+            search_results = resp.json()
+            prs = search_results.get("items", [])
+            
+            if not prs:
+                break
+                
+            for pr in prs:
+                user_pr_count += 1
+                pr_number = pr["number"]
+                pr_title = pr["title"]
+                
+                print(f"      📋 PR #{pr_number}: {pr_title[:50]}...")
+                
+                # Get commits for this PR
+                pr_commits_url = f"https://api.github.com/repos/{repo}/pulls/{pr_number}/commits"
+                commits_resp = requests.get(pr_commits_url, headers=HEADERS)
+                
+                if commits_resp.status_code == 200:
+                    pr_commits = commits_resp.json()
+                    
+                    for commit in pr_commits:
+                        commit_date = commit["commit"]["author"]["date"]
+                        commit_datetime = datetime.fromisoformat(commit_date.replace('Z', '+00:00'))
+                        
+                        start_date = datetime.fromisoformat(REPORT_START.replace('Z', '+00:00'))
+                        end_date = datetime.fromisoformat(REPORT_END.replace('Z', '+00:00'))
+                        
+                        # Only include commits within our date range
+                        if start_date <= commit_datetime <= end_date:
+                            user_commit_count += 1
+                            all_commits.append({
+                                "sha": commit["sha"],
+                                "message": commit["commit"]["message"],
+                                "date": commit_date,
+                                "url": commit["html_url"],
+                                "repo": repo,
+                                "branch": pr.get("pull_request", {}).get("head", {}).get("ref", "unknown"),
+                                "pr_number": pr_number,
+                                "pr_title": pr_title,
+                                "author": username
+                            })
+            
+            # Check if there are more pages
+            if len(prs) < 100:
+                break
+            page += 1
+                            
+        print(f"      ✅ Found {user_pr_count} PRs with {user_commit_count} commits in date range")
+    
+    return all_commits
+
+def get_team_branches(repo, team_usernames):
+    """
+    Get branches that have recent commits by team members
+    This is much more targeted than searching all 990 branches
+    """
+    print(f"🔍 Finding branches with team member activity in {repo}...")
+    
+    team_branches = set()
+    
+    # Always include default branches
+    default_branches = ["master", "main"]
+    team_branches.update(default_branches)
+    
+    # Search for branches by finding recent commits from team members
+    for username in team_usernames:
+        print(f"   👤 Checking recent activity by {username}...")
+        
+        # Get recent commits by this user
+        commits_url = f"https://api.github.com/repos/{repo}/commits"
+        params = {
+            "author": username,
+            "since": REPORT_START,
+            "until": REPORT_END,
+            "per_page": 20  # Get recent commits to find active branches
+        }
+        
+        resp = requests.get(commits_url, headers=HEADERS, params=params)
+        if resp.status_code == 200:
+            commits = resp.json()
+            print(f"      📊 Found {len(commits)} recent commits")
+            
+            # For each recent commit, find which branches contain it
+            for commit in commits[:10]:  # Check first 10 commits
+                commit_sha = commit["sha"]
+                
+                # Get branches that contain this commit
+                branches_url = f"https://api.github.com/repos/{repo}/commits/{commit_sha}/branches-where-head"
+                branch_resp = requests.get(branches_url, headers=HEADERS)
+                
+                if branch_resp.status_code == 200:
+                    branches_data = branch_resp.json()
+                    for branch_info in branches_data:
+                        branch_name = branch_info["name"]
+                        if branch_name not in team_branches:
+                            team_branches.add(branch_name)
+                            print(f"         ✅ Added branch: {branch_name}")
+        else:
+            print(f"      ❌ No recent commits found for {username}")
+    
+    # Also add most recent 30 branches as backup (GitHub returns most active first)
+    print(f"   🔄 Adding most recent branches as backup...")
+    recent_branches_url = f"https://api.github.com/repos/{repo}/branches"
+    resp = requests.get(recent_branches_url, headers=HEADERS, params={"per_page": 30})
+    
+    if resp.status_code == 200:
+        recent_branches = resp.json()
+        added_count = 0
+        for branch_info in recent_branches:
+            branch_name = branch_info["name"]
+            if branch_name not in team_branches:
+                team_branches.add(branch_name)
+                added_count += 1
+        print(f"      📁 Added {added_count} recent branches")
+    
+    team_branches_list = list(team_branches)
+    print(f"\n📋 Total branches to search: {len(team_branches_list)}")
+    
+    # Show the branches we'll search
+    print(f"🌿 Branches selected for search:")
+    sorted_branches = sorted(team_branches_list)
+    for i, branch in enumerate(sorted_branches[:12]):
+        print(f"   {i+1:2d}. {branch[:50]:50}")
+    
+    if len(team_branches_list) > 12:
+        print(f"   ... and {len(team_branches_list) - 12} more branches")
+    
+    return team_branches_list
+
 def fetch_commits(repo, username):
     commits = []
     if BRANCHES is None:
@@ -312,12 +483,29 @@ def create_team_trend_chart(team_name, team_members, team_activity):
     plt.savefig(f'weekly_commit_trend_{team_name.lower()}_{START_DATE_STR}_to_{END_DATE_STR}.png', dpi=300, bbox_inches='tight')
     plt.close()
 
-# Run for all users and repos
-for user in USERS:
-    print(f"\nFetching commits for {user}...")
-    for repo in REPOS:
-        commits = fetch_commits(repo, user)
-        team_activity[user].extend(commits)
+# Run for all users and repos using PR-BASED DISCOVERY
+print("\n" + "="*70)
+print("🎯 SMART PR DISCOVERY: Searching Pull Requests by team members")
+print("="*70)
+
+for repo in REPOS:
+    print(f"\n📊 Processing repository: {repo}")
+    
+    # Get commits from PRs created by team members
+    all_pr_commits = get_team_commits_from_prs(repo, USERS)
+    
+    # Organize commits by user
+    print(f"\n� Organizing {len(all_pr_commits)} commits by team member...")
+    
+    for commit in all_pr_commits:
+        author = commit["author"]
+        if author in USERS:  # Ensure the author is in our team list
+            team_activity[author].append(commit)
+    
+    # Print results for each user
+    for user in USERS:
+        user_commits = team_activity[user]
+        print(f"   ✅ Found {len(user_commits)} commits for {user}")
 
 # ==== Print Summary ====
 print("\n=== Team Productivity Summary ===")
@@ -330,7 +518,7 @@ for team_name, team_members in TEAMS.items():
 if SAVE_TO_CSV:
     # Save detailed commit data
     with open(CSV_FILENAME, mode="w", newline="", encoding="utf-8") as csvfile:
-        fieldnames = ["username", "repo", "sha", "date", "message", "url"]
+        fieldnames = ["username", "repo", "sha", "date", "message", "url", "branch", "pr_number", "pr_title"]
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
 
@@ -342,7 +530,10 @@ if SAVE_TO_CSV:
                     "sha": commit["sha"],
                     "date": commit["date"],
                     "message": commit["message"],
-                    "url": commit["url"]
+                    "url": commit["url"],
+                    "branch": commit.get("branch", ""),
+                    "pr_number": commit.get("pr_number", ""),
+                    "pr_title": commit.get("pr_title", "")
                 })
 
     print(f"\n✅ Saved detailed commit data to '{CSV_FILENAME}'")
